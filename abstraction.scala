@@ -10,6 +10,8 @@
 //> using lib "org.http4s::http4s-dsl:0.23.18"
 //> using lib "com.monovore::decline:2.4.1"
 //> using lib "com.monovore::decline-effect:2.4.1"
+//> using lib "co.fs2::fs2-core:3.6.1"
+//> using lib "co.fs2::fs2-io:3.6.1"
 
 /* コマンドラインオプション */
 import cats.effect._
@@ -46,6 +48,9 @@ import sttp.tapir.json.circe._
 import sttp.model.Header
 import sttp.model.MediaType
 import io.circe.generic.auto._
+import org.http4s.Response
+import org.http4s.Request
+import OpenAI.CompletionResult
 
 object OpenAI {
   lazy val BasicEndpoint = endpoint
@@ -116,14 +121,20 @@ object Main
       openAiOrg
     ) mapN { (domain, role, subject, nOfPoint, apikey, org) =>
 
-      val body = """ ここに本文をなんとかして読み込ませる(stdinとかでいい) """.stripMargin
+      val readBodyAll: IO[String] =
+        fs2.io.stdinUtf8[IO](4096).intersperse("\n").compile.string
 
       val prefix =
         s"あなたは${domain}に詳しい${role}。以下の${subject}を、タイトルと要約の2点をそれぞれ改行で分けて日本語で説明して。要点は${nOfPoint}行程度の箇条書きで。\n"
 
       // Interpret the tapir endpoint as a http4s request and a response parser.
       import sttp.tapir.client.http4s.Http4sClientInterpreter
-      val (req, resParser) =
+      def reqResParser(body: String): (
+          Request[cats.effect.IO],
+          Response[cats.effect.IO] => IO[
+            DecodeResult[Either[String, CompletionResult]]
+          ]
+      ) =
         Http4sClientInterpreter[IO]()
           .toSecureRequest(
             OpenAI.completion,
@@ -158,9 +169,12 @@ object Main
         case _ => httpClientResource
       }
 
-      val requesting: Client[IO] => IO[
+      val requesting: String => Client[IO] => IO[
         DecodeResult[Either[String, OpenAI.CompletionResult]]
-      ] = _.run(req).use(resParser)
+      ] = (s: String) =>
+        reqResParser(s) match {
+          case (req, resParser) => _.run(req).use(resParser)
+        }
 
       val show: DecodeResult[Either[String, OpenAI.CompletionResult]] => IO[
         Unit
@@ -179,10 +193,12 @@ object Main
           IO.println(s"invalid: $errors")
       }
       // use client resource
-      IO.println(s"PREFIX: $prefix") >> loggingClientResource.use(
-        (Kleisli(requesting) >>> Kleisli(show)).run
-      ) >> IO.pure(
-        ExitCode.Success
-      )
+      for {
+        _ <- IO.println(s"PREFIX: $prefix")
+        body <- readBodyAll
+        _ <- loggingClientResource.use(
+          (Kleisli(requesting(body)) >>> Kleisli(show)).run
+        )
+      } yield ExitCode.Success
     }
 }
